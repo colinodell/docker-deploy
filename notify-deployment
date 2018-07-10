@@ -1,0 +1,132 @@
+#!/bin/bash
+
+show_help () {
+  echo "Usage: `basename $0` [success|failure] <notificaiton endpoint(s)>"
+  echo ""
+  echo "At least one notification endpoint must be defined:"
+  echo "  --slack=<Slack webhook url>"
+  echo "  --new-relic-api-key=<New Relic API key> --new-relic-app-id=<New Relic Application ID>"
+  echo ""
+  echo "Examples:"
+  echo ""
+  echo "`basename $0` success --slack=https://example.slack.com/afasidufasdfsadf --new-relic-api-key=owhesfassafawef --new-relic-app-id=123123"
+  echo "`basename $0` failure --slack=https://example.slack.com/afasidufasdfsadf"
+}
+
+# Parse options
+for i in "$@"
+do
+case $i in
+    success)
+    TYPE="success"
+    shift # past "success"
+    ;;
+    fail|failure)
+    TYPE="failure"
+    shift # past "fail" or "failure"
+    ;;
+    --slack=*)
+    NOTIFICATION__SLACK_WEBHOOK="${i#*=}"
+    HAS_NOTIFICATION=1
+    shift # past argument=value
+    ;;
+    --new-relic-api-key=*)
+    NOTIFICATION__NEW_RELIC_API_KEY="${i#*=}"
+    HAS_NOTIFICATION=1
+    shift # past argument=value
+    ;;
+    --new-relic-app-id=*)
+    NOTIFICATION__NEW_RELIC_APP_ID="${i#*=}"
+    shift # past argument=value
+    ;;
+    --sentry-webhook=*)
+    NOTIFICATION__SENTRY_WEBHOOK="${i#*=}"
+    HAS_NOTIFICATION=1;
+    shift # past argument=value
+    ;;
+    -h|--help)
+    show_help
+    exit 1
+    ;;
+    *)
+            # unknown option
+    ;;
+esac
+done
+
+if [ -z "$TYPE" ]; then
+    show_help
+    exit 1
+fi
+
+if [ -z $HAS_NOTIFICATION ]; then
+    show_help
+    exit 1
+fi
+
+COMMIT_MSG=$(git show ${CI_COMMIT_SHA} --format="%s" | head -n 1)
+
+if [ -z "$NOTIFICATION__SLACK_WEBHOOK" ]; then
+    : # Slack webhook not set; skipping the deployment notification
+else
+    [[ $TYPE = "success" ]] && SLACK_COLOR="good" || SLACK_COLOR="danger"
+    [[ $TYPE = "success" ]] && SLACK_RESULT="deployed" || SLACK_RESULT="failed deployment"
+    [[ $CI_ENVIRONMENT_URL ]] && TARGET_ENV="<${CI_ENVIRONMENT_URL}|${CI_ENVIRONMENT_NAME}>" || TARGET_ENV="${CI_ENVIRONMENT_NAME}"
+
+    curl -X POST "${NOTIFICATION__SLACK_WEBHOOK}" \
+         -H "Content-Type: application/json" \
+         -sS \
+         -d \
+"{
+   \"attachments\": [
+      {
+         \"fallback\": \"<${CI_PROJECT_URL}/commit/${CI_COMMIT_SHA}|${CI_COMMIT_REF_NAME}> ${SLACK_RESULT} to ${TARGET_ENV} by ${GITLAB_USER_NAME}\",
+         \"pretext\": \"<${CI_PROJECT_URL}/commit/${CI_COMMIT_SHA}|${CI_COMMIT_REF_NAME}> ${SLACK_RESULT} to ${TARGET_ENV} by ${GITLAB_USER_NAME}\",
+         \"title\": \"${CI_PROJECT_PATH}\",
+         \"title_link\": \"${CI_PROJECT_URL}/builds/${CI_JOB_ID}\",
+         \"text\": \"${COMMIT_MSG}\",
+         \"footer\": \"Commit: ${CI_COMMIT_SHA:0:8} | Pipeline: ${CI_PIPELINE_ID} | Source: ${CI_PIPELINE_SOURCE} | Runner: ${CI_RUNNER_DESCRIPTION}\",
+         \"footer_icon\": \"https://i.imgur.com/v5SB3fR.png\",
+         \"color\": \"${SLACK_COLOR}\"
+      }
+   ]
+}"
+    echo ""
+
+fi
+
+if [ -z "$NOTIFICATION__NEW_RELIC_API_KEY" ]; then
+    : # New Relic API key not set; skipping the deployment notification
+else
+
+    curl -X POST "https://api.newrelic.com/v2/applications/${NOTIFICATION__NEW_RELIC_APP_ID}/deployments.json" \
+         -H "X-Api-Key:${NOTIFICATION__NEW_RELIC_API_KEY}" -i \
+         -H "Content-Type: application/json" \
+         -sS \
+         -d \
+"{
+  \"deployment\": {
+    \"revision\": \"${CI_COMMIT_SHA:0:8} (#${CI_JOB_ID})\",
+    \"description\": \"${COMMIT_MSG}\",
+    \"changelog\": \"${CI_PROJECT_URL}/commit/${CI_COMMIT_SHA}\",
+    \"user\": \"${GITLAB_USER_EMAIL}\"
+  }
+}" || true
+    echo ""
+fi
+
+if [ -z "$NOTIFICATION__SENTRY_WEBHOOK" ]; then
+    : # Sentry webhook not set; skipping the deployment notification
+else
+    curl "${NOTIFICATION__SENTRY_WEBHOOK}" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d \
+"{
+  \"version\": \"${CI_COMMIT_SHA:0:8}\",
+  \"environment\": \"${CI_ENVIRONMENT_NAME}\"
+}" || true
+    echo ""
+fi
+
+echo "Notification(s) sent"
